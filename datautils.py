@@ -13,8 +13,8 @@ def get_wikitext2(nsamples, seed, seqlen, model, tokenizer=None):
     testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
 
     if tokenizer is None:
-        from transformers import AutoTokenizer 
-        tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False)
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model, use_fast=True, trust_remote_code=True)
     trainenc = tokenizer("\n\n".join(traindata['text']), return_tensors='pt')
     testenc = tokenizer("\n\n".join(testdata['text']), return_tensors='pt')
 
