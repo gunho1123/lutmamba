@@ -78,51 +78,131 @@ def get_best_scale_bias(x):
     bias = torch.mean(x, dim=1) - torch.mean(quanted_x, dim=1) 
     return scale, bias
 
+# @torch.inference_mode()
+# def quantize_shift(w, qbits, rounds=15, group_size=-1, transpose=False, use_bst=True, apot_nums = 3):
+#     '''
+#     rounds == 0: greedy algorithm
+#     rounds == 1: refined greedy algorithm
+#     rounds >= 2: alternating algorithm
+
+#     :param w: a weight tensor of layer
+#     :param qbits: number of quantization bits for the `w`
+#     :param rounds: number of iterations for refining both alpha and B
+#     :param group_size: number of weights in which a scaling factor can be shared
+#     :param transpose: if `transpose` is True, `w` is a transposed when using this method.
+#     :param use_bst: if `use_bst` is True(default), the binary matrix is calculated using BST algorithm.
+#                     if `use_bst` is False, the binary matrix is calculated with greedy algorithm.
+#     :param apot_nums: number of additive-shift weight for quantization.
+#     '''
+#     # w_ = w.clone()
+#     w_ = w
+#     w_ = w_.cuda()
+
+#     if transpose:
+#         assert len(w_.shape) == 2, f'Check your weight shape {w_.shape}'
+#         w_ = w_.transpose(1, 0).contiguous()
+    
+#     orig_shape = w_.shape
+#     group_size = group_size if group_size > 0 else orig_shape[-1]
+#     w_ = w_.view([-1, group_size])
+
+#     wf = torch.ones(w_.shape, dtype=torch.float32, device=w_.device)    
+#     ret, B, alpha = greedy_mean_torch(w_, n_bits=qbits, wf=wf)
+#     if rounds > 0 and qbits > 1:
+#         for _ in range(rounds):
+#             ret, B, alpha = refine_mean_torch(w_, ret, B, alpha, wf=wf, use_bst=use_bst, apot_nums=apot_nums)
+
+#     ret = torch.einsum('ijl,il->ij', (B, alpha))
+#     ret = ret.view(orig_shape) 
+#     if transpose:
+#         ret = ret.transpose(1, 0).contiguous()
+
+#     del w_
+
+#     B = B.reshape([orig_shape[0], orig_shape[1] // group_size, group_size, qbits])
+#     alpha = alpha.reshape([orig_shape[0], orig_shape[1] // group_size, qbits])
+
+#     B = B.to('cpu')
+#     # alpha = alpha.to('cpu')
+
+#     torch.cuda.empty_cache()
+#     return ret, B, alpha
+
 @torch.inference_mode()
 def quantize_shift(w, qbits, rounds=15, group_size=-1, transpose=False, use_bst=True, apot_nums = 3):
-    '''
-    rounds == 0: greedy algorithm
-    rounds == 1: refined greedy algorithm
-    rounds >= 2: alternating algorithm
-
-    :param w: a weight tensor of layer
-    :param qbits: number of quantization bits for the `w`
-    :param rounds: number of iterations for refining both alpha and B
-    :param group_size: number of weights in which a scaling factor can be shared
-    :param transpose: if `transpose` is True, `w` is a transposed when using this method.
-    :param use_bst: if `use_bst` is True(default), the binary matrix is calculated using BST algorithm.
-                    if `use_bst` is False, the binary matrix is calculated with greedy algorithm.
-    :param apot_nums: number of additive-shift weight for quantization.
-    '''
-    # w_ = w.clone()
-    w_ = w
-    w_ = w_.cuda()
+    """
+    group_size가 마지막 차원 길이로 나누어떨어지지 않아도 작동하도록 패딩과 마스크를 사용.
+    - 마지막 그룹은 0으로 패딩
+    - wf(가중 마스크)로 패딩 위치를 0 가중치 처리
+    - 양자화 후 원래 크기로 언패딩
+    반환:
+      ret: 원래 weight와 같은 shape
+      B:   [M, ceil(N/group), group_size, qbits]  (마지막 그룹 일부는 패딩 위치)
+      alpha:[M, ceil(N/group), qbits]
+    """
+    # w_ 준비
+    w_ = w.cuda() if w.device.type != "cuda" else w
 
     if transpose:
         assert len(w_.shape) == 2, f'Check your weight shape {w_.shape}'
         w_ = w_.transpose(1, 0).contiguous()
-    
-    orig_shape = w_.shape
-    group_size = group_size if group_size > 0 else orig_shape[-1]
-    w_ = w_.view([-1, group_size])
 
-    wf = torch.ones(w_.shape, dtype=torch.float32, device=w_.device)    
-    ret, B, alpha = greedy_mean_torch(w_, n_bits=qbits, wf=wf)
+    assert len(w_.shape) == 2, f'Expected 2D weight, got {w_.shape}'
+    orig_shape = w_.shape  # (M, N)
+    M, N = orig_shape
+
+    gs = group_size if group_size > 0 else N
+    # ceil 그룹 수 및 패딩 길이
+    num_groups = (N + gs - 1) // gs
+    pad_len = num_groups * gs - N
+
+    # 패딩된 weight와 마스크(wf) 구성
+    if pad_len > 0:
+        pad = torch.zeros((M, pad_len), dtype=w_.dtype, device=w_.device)
+        w_pad = torch.cat([w_, pad], dim=1)
+        mask = torch.ones((M, N), dtype=torch.float32, device=w_.device)
+        if pad_len > 0:
+            mask = torch.cat([mask, torch.zeros((M, pad_len), dtype=torch.float32, device=w_.device)], dim=1)
+    else:
+        w_pad = w_
+        mask  = torch.ones((M, N), dtype=torch.float32, device=w_.device)
+
+    # [M*num_groups, gs]로 펴기
+    w_grouped = w_pad.view(-1, gs)                            # I = M*num_groups
+    wf = mask.view(-1, gs).to(torch.float32)                  # 같은 shape로 가중 마스크
+
+    # 초기 양자화
+    ret, B, alpha = greedy_mean_torch(w_grouped, n_bits=qbits, wf=wf)
+
+    # refine
     if rounds > 0 and qbits > 1:
         for _ in range(rounds):
-            ret, B, alpha = refine_mean_torch(w_, ret, B, alpha, wf=wf, use_bst=use_bst, apot_nums=apot_nums)
+            ret, B, alpha = refine_mean_torch(
+                w_grouped, ret, B, alpha, wf=wf, use_bst=use_bst, apot_nums=apot_nums
+            )
 
-    ret = torch.einsum('ijl,il->ij', (B, alpha))
-    ret = ret.view(orig_shape) 
+    # 재구성: [I, gs] -> [M, num_groups*gs] -> 잘라서 [M, N]
+    # B:[I, gs, qbits], alpha:[I, qbits]
+    ret = torch.einsum('ijl,il->ij', (B, alpha))              # [I, gs]
+    ret = ret.view(M, num_groups * gs)[:, :N]                 # [M, N]
+
+    # 원래 transpose였으면 되돌리기
     if transpose:
         ret = ret.transpose(1, 0).contiguous()
 
-    del w_
+    # B/alpha를 그룹 차원으로 재구성 (마지막 그룹 일부는 패딩 위치)
+    B = B.view(M, num_groups, gs, qbits)
+    alpha = alpha.view(M, num_groups, qbits)
 
-    B = B.reshape([orig_shape[0], orig_shape[1] // group_size, group_size, qbits])
-    alpha = alpha.reshape([orig_shape[0], orig_shape[1] // group_size, qbits])
+    # (선택) 마지막 그룹의 패딩 위치를 0으로 정리하고 싶으면 주석 해제
+    # if pad_len > 0:
+    #     valid_in_last = gs - pad_len if num_groups > 0 else 0
+    #     if valid_in_last >= 0:
+    #         B[:, -1, valid_in_last:, :] = 0.0
 
+    # 반환 형태/디바이스 정리 (기존 코드와 호환: B는 CPU로)
     B = B.to('cpu')
+    # alpha는 GPU에 유지 (필요하면 주석 해제)
     # alpha = alpha.to('cpu')
 
     torch.cuda.empty_cache()
