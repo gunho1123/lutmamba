@@ -2,6 +2,90 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+def pseudo_quantize_tensor(w, n_bit=8,
+                           zero_point=True, q_group_size=-1,
+                           inplace=False,
+                           get_scale_zp=False,
+                           per_ic=False, # 2d w ; col-wise quant
+                           vector_quant=False, # w is a vector
+                           ):
+    # only one of them can be true; 
+    assert per_ic & vector_quant == False 
+    if per_ic:
+        w = w.T #[OC, IC] -> [IC, OC]
+    if vector_quant:
+        w = w.unsqueeze(0)
+    org_w_shape = w.shape
+
+    if q_group_size > 0:
+        # Store original shape before padding
+        original_shape = org_w_shape
+        # Handle cases where tensor dimension is not divisible by group size
+        if org_w_shape[-1] % q_group_size != 0:
+            # Always use padding to make tensor dimension divisible by group size
+            # Calculate how many elements need to be added
+            current_size = org_w_shape[-1]
+            target_size = ((current_size + q_group_size - 1) // q_group_size) * q_group_size
+            padding_size = target_size - current_size
+            
+            w = torch.nn.functional.pad(w, (0, padding_size), mode='constant', value=0)
+            print(f"Warning: Padding tensor from {current_size} to {target_size} to match group size {q_group_size}")
+            org_w_shape = w.shape
+            
+        assert org_w_shape[-1] % q_group_size == 0
+        w = w.reshape(-1, q_group_size)
+    assert w.dim() == 2
+    if zero_point:
+        max_val = w.amax(dim=1, keepdim=True)
+        min_val = w.amin(dim=1, keepdim=True)
+        max_int = 2 ** n_bit - 1
+        min_int = 0
+        scales = (max_val - min_val).clamp(min=1e-5) / max_int
+        zeros = (-torch.round(min_val / scales)).clamp_(min_int, max_int)
+    else:  # we actually never used this
+        assert min_val is None
+        max_val = w.abs().amax(dim=1, keepdim=True)
+        max_val = max_val.clamp(min=1e-5)
+        max_int = 2 ** (n_bit - 1) - 1
+        min_int = - 2 ** (n_bit - 1)
+        scales = max_val / max_int
+        zeros = 0
+
+    assert torch.isnan(scales).sum() == 0
+    assert torch.isnan(w).sum() == 0
+
+    if inplace:
+        ((w.div_(scales).round_().add_(zeros)).clamp_(
+            min_int, max_int).sub_(zeros)).mul_(scales)
+    else:
+        w = (torch.clamp(torch.round(w / scales) +
+                         zeros, min_int, max_int) - zeros) * scales
+    assert torch.isnan(w).sum() == 0
+
+    w = w.reshape(org_w_shape)
+    
+    # Restore original size if padding was applied
+    if q_group_size > 0 and original_shape != org_w_shape:
+        # Remove the padding that was added
+        if len(original_shape) == 1:
+            w = w[:original_shape[0]]
+        elif len(original_shape) == 2:
+            w = w[:original_shape[0], :original_shape[1]]
+        elif len(original_shape) == 3:
+            w = w[:original_shape[0], :original_shape[1], :original_shape[2]]
+        elif len(original_shape) == 4:
+            w = w[:original_shape[0], :original_shape[1], :original_shape[2], :original_shape[3]]
+        print(f"Restored tensor from {org_w_shape} to {original_shape}")
+    
+    if vector_quant:
+        w = w.squeeze(0)
+    if per_ic:
+        w = w.T #[IC, OC] -> [OC, IC]
+
+    if get_scale_zp:
+        return w, scales.view(w.shape[0], -1), zeros.view(w.shape[0], -1)
+    else:
+        return w
 
 def quantize(x, scale, zero, maxq):
     if maxq < 0:

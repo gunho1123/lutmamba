@@ -156,13 +156,13 @@ class GPTQ(QuantMethod):
                 quantizer.find_params(W[:, i:(i + groupsize)])
                 groups.append(quantizer)
 
+        H = self.H
+        
         if args.act_order:
             perm = torch.argsort(torch.diag(H), descending=True)
             W = W[:, perm]
             H = H[perm][:, perm]
             invperm = torch.argsort(perm)
-
-        H = self.H
         Losses = torch.zeros_like(W)
         Q = torch.zeros_like(W)
 
@@ -198,11 +198,18 @@ class GPTQ(QuantMethod):
                     alpha = self.quantizer.alpha[:,group,:].unsqueeze(1)
                     q, BinaryWeight = bcq_quantize(w.unsqueeze(1), alpha, groupsize=-1)
                     q = q.flatten()
+                elif args.per_ic:
+                    q = pseudo_quantize_tensor(w, n_bit=args.wbits, 
+                                                    q_group_size=args.groupsize,
+                                                    vector_quant=True,
+                                                )
                 else:
                     if groupsize != -1:
                         if not args.static_groups:
                             if (i1 + i) % groupsize == 0:
                                 self.quantizer.find_params(W[:, (i1 + i):(i1 + i + groupsize)], weight=True)
+                                print("GROUP SIZE: ", groupsize)
+                                print(i1 + i, i1 + i + groupsize)
                         else:
                             idx = i1 + i
                             if args.act_order:

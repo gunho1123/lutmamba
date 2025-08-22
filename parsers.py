@@ -30,6 +30,10 @@ def parse_args():
 	parser.add_argument(
 			'--nearest', action='store_true',
 			help='Whether to run the RTN baseline.'
+	)
+	parser.add_argument(
+			'--per_ic', action='store_true',
+			help='Whether to run the per ic quantization.'
 	) 
 	parser.add_argument(
 			'--wbits', type=int, default=16, choices=[2, 3, 4, 8, 16],
