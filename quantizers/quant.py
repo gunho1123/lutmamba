@@ -29,7 +29,7 @@ def pseudo_quantize_tensor(w, n_bit=8,
             padding_size = target_size - current_size
             
             w = torch.nn.functional.pad(w, (0, padding_size), mode='constant', value=0)
-            print(f"Warning: Padding tensor from {current_size} to {target_size} to match group size {q_group_size}")
+            # print(f"Warning: Padding tensor from {current_size} to {target_size} to match group size {q_group_size}")
             org_w_shape = w.shape
             
         assert org_w_shape[-1] % q_group_size == 0
@@ -75,7 +75,7 @@ def pseudo_quantize_tensor(w, n_bit=8,
             w = w[:original_shape[0], :original_shape[1], :original_shape[2]]
         elif len(original_shape) == 4:
             w = w[:original_shape[0], :original_shape[1], :original_shape[2], :original_shape[3]]
-        print(f"Restored tensor from {org_w_shape} to {original_shape}")
+        # print(f"Restored tensor from {org_w_shape} to {original_shape}")
     
     if vector_quant:
         w = w.squeeze(0)

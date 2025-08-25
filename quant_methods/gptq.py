@@ -208,8 +208,6 @@ class GPTQ(QuantMethod):
                         if not args.static_groups:
                             if (i1 + i) % groupsize == 0:
                                 self.quantizer.find_params(W[:, (i1 + i):(i1 + i + groupsize)], weight=True)
-                                print("GROUP SIZE: ", groupsize)
-                                print(i1 + i, i1 + i + groupsize)
                         else:
                             idx = i1 + i
                             if args.act_order:

@@ -18,22 +18,28 @@ from quantizers.bcq_quant.quantizer import BCQuantizer
 from lut_gemm.kernel import load_shiftaddllm_weight
 
 from transformers import AutoTokenizer
+from model.modeling_hymba import HymbaForCausalLM
 
-
-def get_mamba(model):
+def get_hymba(model):
     import torch
     def skip(*args, **kwargs):
         pass
     torch.nn.init.kaiming_uniform_ = skip
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
-    from transformers import MambaForCausalLM
-    model = MambaForCausalLM.from_pretrained(model, torch_dtype='auto')
+    from transformers import AutoModelForCausalLM
+    from transformers import AutoConfig
+
+    # config = AutoConfig.from_pretrained(model, trust_remote_code=True)
+    # config.use_mamba_kernels=False
+    model = HymbaForCausalLM.from_pretrained(model, torch_dtype='auto', trust_remote_code=True)
+    # model = AutoModelForCausalLM.from_config(config)
     model.seqlen = 2048
     return model
+
 @torch.no_grad()
-def mamba_sequential(model, dataloader, dev):
-    print('Starting ...')
+def hymba_sequential(model, dataloader, dev):
+    print('Starting Hymba quantization ...')
 
     use_cache = getattr(model.config, "use_cache", None)
     if use_cache is not None:
@@ -52,13 +58,14 @@ def mamba_sequential(model, dataloader, dev):
                 return cur, p
         return None, None
 
+    # Hymba 모델의 레이어 구조 탐색
     layers, layers_prefix = _get(model, [
         "backbone.layers",
-        "model.layers",
+        "model.layers", 
         "layers",
     ])
     if layers is None:
-        raise RuntimeError("Could not locate layers for Mamba model.")
+        raise RuntimeError("Could not locate layers for Hymba model.")
 
     embeddings, emb_path = _get(model, [
         "backbone.embeddings",
@@ -98,6 +105,9 @@ def mamba_sequential(model, dataloader, dev):
             super().__init__()
             self.module = module
         def forward(self, hidden_states, *f_args, **f_kwargs):
+            print("================")
+            print(hidden_states.shape)
+            print("================")
             inps[cache['i']] = hidden_states
             cache['i'] += 1
             cache['attention_mask'] = f_kwargs.get('attention_mask', None)
@@ -141,19 +151,29 @@ def mamba_sequential(model, dataloader, dev):
 
     quantizers = {}
 
-    # ----- 레이어별 처리 -----
+    # ----- Hymba 레이어별 처리 -----
     for i in range(len(layers)):
         layer = layers[i].to(dev)
 
+        # Hymba는 Transformer와 Mamba를 결합한 하이브리드 구조
         full = {n: m for n, m in find_layers(layer).items() if isinstance(m, nn.Linear)}
 
         if args.true_sequential:
-            group1 = [n for n in full if "mixer" in n and n.endswith("in_proj")]
-            group2 = [n for n in full if "mixer" in n and n.endswith("out_proj")]
-            others = [n for n in full if n not in group1 + group2]
+            # Hymba의 하이브리드 구조를 고려한 그룹핑
+            # Transformer attention 관련
+            group1 = [n for n in full if any(x in n for x in ["q_proj", "k_proj", "v_proj", "o_proj"])]
+            # Mamba mixer 관련  
+            group2 = [n for n in full if "mixer" in n and n.endswith("in_proj")]
+            group3 = [n for n in full if "mixer" in n and n.endswith("out_proj")]
+            # 기타 MLP 관련
+            group4 = [n for n in full if any(x in n for x in ["gate_proj", "up_proj", "down_proj", "fc1", "fc2"])]
+            others = [n for n in full if n not in group1 + group2 + group3 + group4]
+            
             sequential = []
             if group1: sequential.append(group1)
             if group2: sequential.append(group2)
+            if group3: sequential.append(group3)
+            if group4: sequential.append(group4)
             if others: sequential.append(others)
             if not sequential:
                 sequential = [list(full.keys())]
@@ -212,7 +232,7 @@ def mamba_sequential(model, dataloader, dev):
 
             for j in range(args.nsamples):
                 hs = inps[j].unsqueeze(0)
-                ret = layer(hs)  # Mamba block forward
+                ret = layer(hs)  # Hymba block forward
                 out = ret[0] if isinstance(ret, (list, tuple)) else ret
                 outs[j] = out
 
@@ -222,9 +242,9 @@ def mamba_sequential(model, dataloader, dev):
                 quant_method[name].post_batch()
 
             for name in subset:
-                # if "dt_proj" in name:
-                if True:
-                    print(" ====== ", i, name, " ====== ")
+                # Hymba의 Mamba 부분과 Transformer 부분을 구분하여 처리
+                if any(x in name for x in ["dt_proj", "mixer"]) or "mixer" in name:
+                    print(" ====== Hymba Mamba Layer ", i, name, " ====== ")
                     quant_method[name].preproc(
                         preproc_gptqH=args.pre_gptqH, percdamp=args.percdamp,
                         preproc_rescale=args.pre_rescale,
@@ -238,7 +258,7 @@ def mamba_sequential(model, dataloader, dev):
                     quantizers[save_key] = quant_method[name].quantizer
                     quant_method[name].free()
                 else:
-                    print(" ====== SKIP ", i, name, " ====== ")
+                    print(" ====== SKIP Hymba Layer ", i, name, " ====== ")
 
             for j in range(args.nsamples):
                 hs = inps[j].unsqueeze(0)
@@ -259,8 +279,8 @@ def mamba_sequential(model, dataloader, dev):
     return quantizers
 
 @torch.no_grad()
-def mamba_eval(model, testenc, dev):
-    print('Evaluating (Mamba) ...')
+def hymba_eval(model, testenc, dev):
+    print('Evaluating (Hymba) ...')
 
     # testenc: BatchEncoding or tensor
     input_ids = getattr(testenc, "input_ids", testenc)
@@ -292,15 +312,16 @@ def mamba_eval(model, testenc, dev):
             cur = getattr(cur, k)
         return cur
 
+    # Hymba 모델의 레이어 구조 탐색
     layers, layers_path = _find_first(model, ["backbone.layers", "model.layers", "layers"])
     if layers is None:
-        raise RuntimeError("Could not locate layers for Mamba model.")
+        raise RuntimeError("Could not locate layers for Hymba model.")
 
     embeddings, emb_path = _find_first(model, ["backbone.embeddings", "model.embed_tokens", "embed_tokens"])
     final_norm, norm_path = _find_first(model, ["backbone.norm_f", "backbone.norm", "model.norm", "norm"])
     lm_head, head_path = _find_first(model, ["lm_head", "model.lm_head"])
     if lm_head is None:
-        raise RuntimeError("Could not locate lm_head for Mamba model.")
+        raise RuntimeError("Could not locate lm_head for Hymba model.")
 
     if embeddings is not None:
         embeddings.to(dev)
@@ -397,10 +418,10 @@ if __name__ == '__main__':
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
-    model = get_mamba(args.model)
+    model = get_hymba(args.model)
     if args.load:
         model.load_state_dict(torch.load(args.load))
-    model.eval()
+    model.eval().cuda()
     print(model)
 
     if args.load_temp_storage is not None:
@@ -418,7 +439,7 @@ if __name__ == '__main__':
             print("quantizing with bcq")
             model = quant_model(model, qbits=args.wbits, group_size=args.groupsize)
         else:
-            quantizers = mamba_sequential(model, dataloader, DEV)
+            quantizers = hymba_sequential(model, dataloader, DEV)
         print("full quantization time: ",time.time() - tick)
     
     if args.save:
@@ -434,6 +455,6 @@ if __name__ == '__main__':
             dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
         )
         print(dataset)
-        mamba_eval(model, testloader, DEV)
+        hymba_eval(model, testloader, DEV)
 
 

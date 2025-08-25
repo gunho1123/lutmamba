@@ -17,6 +17,7 @@ from quant_methods.quant_model_bcq import quant_model
 from quantizers.bcq_quant.quantizer import BCQuantizer
 from lut_gemm.kernel import load_shiftaddllm_weight
 
+from transformers import AutoTokenizer
 
 def get_llama(model):
     import torch
@@ -33,6 +34,7 @@ def get_llama(model):
 @torch.no_grad()
 def llama_sequential(model, dataloader, dev):
     print('Starting ...')
+    print(f'Per-IC: {args.per_ic}')
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
@@ -270,8 +272,17 @@ if __name__ == '__main__':
 
     if args.temp_storage is not None:
         os.makedirs(args.temp_storage, exist_ok=True)
+    
+    # tokenizer_kwargs = {
+    #     "cache_dir": model_args.cache_dir,
+    #     "use_fast": model_args.use_fast_tokenizer,
+    #     "revision": model_args.model_revision,
+    #     "token": model_args.token,
+    #     "trust_remote_code": model_args.trust_remote_code,
+    # }
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
 
-    model = get_llama(args.model)
+    model = get_llama(args.model).cuda()
     if args.load:
         model.load_state_dict(torch.load(args.load))
     model.eval()
@@ -280,13 +291,13 @@ if __name__ == '__main__':
     if args.load_temp_storage is not None:
         assert args.block_quant, "temp_storage only work for blockwise (i.e lat. method) quantization"
         load_shiftaddllm_weight(model, args.load_temp_storage, model_name=str(args.model).split("/")[-1],
-                                wbits=args.wbits, groupsize=args.groupsize)
+                                wbits=args.wbits, is_lat=args.lat)
 
     dataloader, testloader = get_loaders(
         args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model.seqlen
     )
     
-    if args.wbits < 16 and not args.nearest:
+    if args.wbits < 16 and not args.nearest and args.load_temp_storage is None:
         tick = time.time()
         if args.bcq:
             print("quantizing with bcq")
@@ -296,12 +307,17 @@ if __name__ == '__main__':
         print("full quantization time: ",time.time() - tick)
     
     if args.save:
-        #llama_pack3(model, quantizers)
-        torch.save(model.state_dict(), args.save)
+        model.save_pretrained(args.save)
+        tokenizer.save_pretrained(args.save)
+
+    # if args.save:
+    #     #llama_pack3(model, quantizers)
+    #     torch.save(model.state_dict(), args.save)
         
-    datasets = ['wikitext2', 'ptb'] 
-    if args.new_eval:
-        datasets = ['wikitext2', 'ptb-new', 'c4-new']
+    datasets = ['wikitext2'] 
+    # datasets = ['wikitext2', 'ptb'] 
+    # if args.new_eval:
+    #     datasets = ['wikitext2', 'ptb-new', 'c4-new']
     for dataset in datasets:
         dataloader, testloader = get_loaders(
             dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
