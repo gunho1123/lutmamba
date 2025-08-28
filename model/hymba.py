@@ -32,7 +32,7 @@ def get_hymba(model):
 
     # config = AutoConfig.from_pretrained(model, trust_remote_code=True)
     # config.use_mamba_kernels=False
-    model = HymbaForCausalLM.from_pretrained(model, torch_dtype='auto', trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(model, torch_dtype='auto', trust_remote_code=True)
     # model = AutoModelForCausalLM.from_config(config)
     model.seqlen = 2048
     return model
@@ -96,7 +96,7 @@ def hymba_sequential(model, dataloader, dev):
 
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros(
-        (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
+        (args.nsamples, model.seqlen+model.config.num_memory_tokens, model.config.hidden_size), dtype=dtype, device=dev
     )
     cache = {'i': 0, 'attention_mask': None}
 
@@ -105,9 +105,9 @@ def hymba_sequential(model, dataloader, dev):
             super().__init__()
             self.module = module
         def forward(self, hidden_states, *f_args, **f_kwargs):
-            print("================")
-            print(hidden_states.shape)
-            print("================")
+            # print("================")
+            # print(hidden_states.shape)
+            # print("================")
             inps[cache['i']] = hidden_states
             cache['i'] += 1
             cache['attention_mask'] = f_kwargs.get('attention_mask', None)
