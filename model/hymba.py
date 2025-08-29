@@ -8,17 +8,16 @@ import torch
 import torch.nn as nn
 
 from quant_methods.gptq import *
-from quant_methods.shiftaddllm import *
+# from quant_methods.shiftaddllm import *
 from modelutils import *
 from parsers import parse_args
 
 from quantizers.quant import *
 from quant_methods.quant_model_bcq import quant_model
 from quantizers.bcq_quant.quantizer import BCQuantizer
-from lut_gemm.kernel import load_shiftaddllm_weight
+# from lut_gemm.kernel import load_shiftaddllm_weight
 
 from transformers import AutoTokenizer
-from model.modeling_hymba import HymbaForCausalLM
 
 def get_hymba(model):
     import torch
@@ -110,15 +109,17 @@ def hymba_sequential(model, dataloader, dev):
             # print("================")
             inps[cache['i']] = hidden_states
             cache['i'] += 1
-            cache['attention_mask'] = f_kwargs.get('attention_mask', None)
+            cache['attention_mask_raw'] = f_kwargs.get('attention_mask_raw', None)
+            cache['position_ids'] = f_kwargs.get('position_ids', None)
             raise ValueError
 
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
         try:
             model_inputs = {"input_ids": batch[0].to(dev)}
-            if isinstance(batch, (list, tuple)) and len(batch) > 1:
-                model_inputs["attention_mask"] = batch[1].to(dev)
+            # if isinstance(batch, (list, tuple)) and len(batch) > 1:
+            #     model_inputs["attention_mask_raw"] = batch[1].to(dev)
+                # model_inputs["position_ids"] = batch[2].to(dev)
             model(**model_inputs)
         except ValueError:
             pass
@@ -138,8 +139,8 @@ def hymba_sequential(model, dataloader, dev):
     torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
-    attention_mask = cache['attention_mask']
-
+    attention_mask_raw = cache['attention_mask_raw']
+    position_ids = cache['position_ids']
     quant_config_dict = None
     if args.quant_config:
         import json
@@ -150,15 +151,23 @@ def hymba_sequential(model, dataloader, dev):
     print('Ready.')
 
     quantizers = {}
+    
+    # KV cache 초기화
+    kv_cache = None
+    
+    # Hymba 모델에서 KV cache 사용을 위해 use_cache를 True로 설정
+    if hasattr(model.config, 'use_cache'):
+        model.config.use_cache = True
+        print(f"Set model.config.use_cache = {model.config.use_cache}")
 
     # ----- Hymba 레이어별 처리 -----
     for i in range(len(layers)):
         layer = layers[i].to(dev)
-
         # Hymba는 Transformer와 Mamba를 결합한 하이브리드 구조
         full = {n: m for n, m in find_layers(layer).items() if isinstance(m, nn.Linear)}
 
         if args.true_sequential:
+        # if True:
             # Hymba의 하이브리드 구조를 고려한 그룹핑
             # Transformer attention 관련
             group1 = [n for n in full if any(x in n for x in ["q_proj", "k_proj", "v_proj", "o_proj"])]
@@ -181,7 +190,6 @@ def hymba_sequential(model, dataloader, dev):
             sequential = [list(full.keys())]
 
         key_prefix = layers_prefix
-
         for names in sequential:
             subset = {n: full[n] for n in names}
 
@@ -231,8 +239,30 @@ def hymba_sequential(model, dataloader, dev):
                 handles.append(subset[name].register_forward_hook(add_batch(name)))
 
             for j in range(args.nsamples):
-                hs = inps[j].unsqueeze(0)
-                ret = layer(hs)  # Hymba block forward
+                # ret = layer(
+                #     inps[j].unsqueeze(0), 
+                #     attention_mask_raw=attention_mask_raw, 
+                #     position_ids=position_ids, 
+                #     cache_position = position_ids.squeeze())[0]
+                
+                # kv_last_layer는 KV cache이므로 첫 번째 레이어에서는 None, 이후에는 이전 레이어의 KV cache 사용
+                kv_last_layer = None if i == 0 else kv_cache
+                
+                temp = layer(
+                    inps[j].unsqueeze(0), 
+                    attention_mask_raw=attention_mask_raw, 
+                    position_ids=position_ids,
+                    kv_last_layer=kv_last_layer)
+                ret = temp[0]
+                
+                # KV cache 업데이트 (두 번째 레이어부터)
+                if i > 0 and len(temp) > 1:
+                    kv_cache = temp[1]
+
+                # hs = inps[j].unsqueeze(0)
+                # print(hs)
+                # exit()
+                # ret = layer(hs)  # Hymba block forward
                 out = ret[0] if isinstance(ret, (list, tuple)) else ret
                 outs[j] = out
 
@@ -243,8 +273,24 @@ def hymba_sequential(model, dataloader, dev):
 
             for name in subset:
                 # Hymba의 Mamba 부분과 Transformer 부분을 구분하여 처리
-                if any(x in name for x in ["dt_proj", "mixer"]) or "mixer" in name:
-                    print(" ====== Hymba Mamba Layer ", i, name, " ====== ")
+                if "x_proj" in name:
+                # if True:
+                    print(" ====== [IC] Hymba Mamba Layer ", i, name, " ====== ")
+                    quant_method[name].preproc(
+                        preproc_gptqH=args.pre_gptqH, percdamp=args.percdamp,
+                        preproc_rescale=args.pre_rescale,
+                        preproc_proj=args.pre_proj, preproc_proj_extra=args.pre_proj_extra
+                    )
+                    args.per_ic = True
+                    quant_method[name].fasterquant(
+                        args, model_name=str(args.model).split("/")[-1], layer_name=f"{i}.{name}"
+                    )
+
+                    save_key = f"{key_prefix}.{i}.{name}"
+                    quantizers[save_key] = quant_method[name].quantizer
+                    quant_method[name].free()
+                else:
+                    print(" ====== [OC] Hymba Mamba Layer ", i, name, " ====== ")
                     quant_method[name].preproc(
                         preproc_gptqH=args.pre_gptqH, percdamp=args.percdamp,
                         preproc_rescale=args.pre_rescale,
@@ -257,12 +303,33 @@ def hymba_sequential(model, dataloader, dev):
                     save_key = f"{key_prefix}.{i}.{name}"
                     quantizers[save_key] = quant_method[name].quantizer
                     quant_method[name].free()
-                else:
-                    print(" ====== SKIP Hymba Layer ", i, name, " ====== ")
 
             for j in range(args.nsamples):
-                hs = inps[j].unsqueeze(0)
-                ret = layer(hs)
+                # hs = inps[j].unsqueeze(0)
+                # ret = layer(hs)
+                
+                # kv_last_layer는 KV cache이므로 첫 번째 레이어에서는 None, 이후에는 이전 레이어의 KV cache 사용
+                kv_last_layer = None if i == 0 else kv_cache
+                temp = layer(
+                    inps[j].unsqueeze(0), 
+                    attention_mask_raw=attention_mask_raw, 
+                    position_ids=position_ids, 
+                    use_cache=True,
+                    kv_last_layer=kv_last_layer)
+                
+                
+                ret = temp[0]
+                
+                # KV cache 업데이트: temp[1] 또는 temp[2]에서 KV cache 찾기
+                if i > 0:
+                    if temp[1] is not None:
+                        kv_cache = temp[1]
+                    elif len(temp) > 2 and temp[2] is not None:
+                        kv_cache = temp[2]
+                    else:
+                        print(f"Warning: Layer {i}에서 KV cache를 찾을 수 없습니다")
+                        kv_cache = None
+
                 out = ret[0] if isinstance(ret, (list, tuple)) else ret
                 outs[j] = out
 
@@ -422,7 +489,7 @@ if __name__ == '__main__':
     if args.load:
         model.load_state_dict(torch.load(args.load))
     model.eval().cuda()
-    print(model)
+    # print(model)
 
     if args.load_temp_storage is not None:
         assert args.block_quant, "temp_storage only work for blockwise (i.e lat. method) quantization"
@@ -456,5 +523,4 @@ if __name__ == '__main__':
         )
         print(dataset)
         hymba_eval(model, testloader, DEV)
-
 

@@ -238,7 +238,7 @@ class GPTQ(QuantMethod):
 
         torch.cuda.synchronize()
         print('time %.2f' % (time.time() - tick))
-        print('error', torch.sum(Losses).item())
+        print('error', torch.mean(Losses).item())
 
         if args.act_order:
             Q = Q[:, invperm]
